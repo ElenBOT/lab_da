@@ -1,4 +1,0 @@
-write example for labber reader
-write example for circle fit
-write a sigkit that do demomulation
-wrap everything so it become module use?
