@@ -1,0 +1,377 @@
+"""The core to read labber hdf file. By Neuro Sama :)
+
+Developer guide:
+
+One can first read the file, then use overview to see its components
+>>> file = LabberHDF(filepath)
+>>> file.overview('111')
+OUTPUT:
+|   Traces:
+|   0 : Time stamp
+|   1 : VNA - S11
+|   2 : VNA - S11_N
+|   3 : VNA - S11_t0dt
+|   ----------
+|   instrument config:
+|   0 : Rohde&Schwarz Network Analyzer 4 port - IP: 192.168.1.4, VNA at localhost
+|   1 : Yokogawa GS200 DC Source - USB: 0xB21::0x39::9017D5818, DC supply - 3 at localhost
+|   2 : Yokogawa GS200 DC Source - USB: 0xB21::0x39::90ZC38696, DC supply - 2 at localhost
+|   3 : Yokogawa GS200 DC Source - USB: 0xB21::0x39::90ZC38697, DC supply - 1 at localhost
+|   ----------
+|   step config:
+|   0 : DC supply - 1 - Current
+|   1 : DC supply - 1 - Output
+|   2 : DC supply - 2 - Current
+|   3 : DC supply - 2 - Output
+|   4 : DC supply - 3 - Current
+|   5 : DC supply - 3 - Output
+|   6 : VNA - # of averages
+|   7 : VNA - # of points
+|   8 : VNA - Average
+|   9 : VNA - Output enabled
+|   10 : VNA - Output power
+|   11 : VNA - S11 - Enabled
+|   12 : VNA - Start frequency
+|   13 : VNA - Stop frequency
+|   14 : VNA - Wait for new trace
+|   ----------
+
+Then one can use .get_trace_by_name(), .get_trace_by_index() etc... to get wanted item.
+>>> vna_s11_t0dt = file.get_trace_by_index(3)
+>>> vna_s11 = file.get_trace_by_name('VNA - S11')
+
+The attribute maps like `stepconfig_map` offers a method to loop through all names.
+>>> # Example: find all sweeping quantity
+>>> sweepings = []
+>>> for index, name in file.stepconfig_map.items():
+>>>     stepconfig = file.get_stepconfig_by_name(name)
+>>>     if stepconfig['Step items']['range_type'] == 'Sweep':
+>>>         sweepings.append((name, stepconfig))
+"""
+
+import numpy as np
+import h5py
+from decimal import Decimal
+
+__all__ = [
+    'LabberHDF',
+    'auto_xyz',
+    'get_zarray'
+]
+
+class LabberHDF:
+    """ The object to read labber measured data, the hfd5 file.
+
+    Attributes:
+        traces_map : dict[int, str]
+            The map from interger to trace name.
+        instconfig_map : dict[int, str]
+            The map from interger to instrument config name.
+        stepconfig_map : dict[int, dict]
+            The map from interger to step config name.
+
+    Methods:
+        overvirew(self) -> None:
+            print an overview of the file.
+        get_trace_by_index(self, index) -> ndarray:
+            Get trace data as an ndarray, using `traces_map` indexing.
+        get_instconfig_by_index(self, index) -> dict:
+            Get instrument config as a dictionary, using `instconfig_map` indexing.
+        get_stepconfig_by_index(self, index) -> dict:
+            Get step config as a dictionary, using `stepconfig_map` indexing.
+    """
+
+    def __init__(self, filepath:str, *, print_traces_map: bool=False):
+        self.filepath = filepath
+        # traces (contains dataset)
+        self.traces_map: dict[int, str] = self._get_int2name_map(
+            groupname='Traces',
+            print_keys=print_traces_map
+        )
+        # instrument configs (contains dataset)
+        self.instconfig_map: dict[int, str] = self._get_int2name_map(
+            groupname='Instrument config'
+        )
+        # Step configs (contains group)
+        self.stepconfig_map: dict[int, str]= self._get_int2name_map(
+            groupname='Step config'
+        )
+        #
+        self.steplist_dict = self._get_step_list_dict()
+
+    def _get_int2name_map(self, groupname, print_keys=False) -> dict:
+        """ Return a dictionary that maps int -> str. \
+            Where int is from 0~n, \
+            str is datates names under the group `groupname`."""
+        temp = {}
+        with h5py.File(self.filepath, 'r') as f:
+            for index, key in enumerate(f[groupname].keys()):
+                if print_keys: print(f'{index} : {key}')
+                temp[index] = key
+        return temp
+
+    
+    def _get_reevaluated_step_item(self, step_item_dict, relparm_dict, stepconfig_groupname):
+        """ reevaluate step item, for Labber only make a portion of step item is correct,\
+            e.g. when range_type is 'start-stop', only 'start' and 'stop' value are coorect.
+            This function reevaluate the step items into more convinient and reable one.
+        """
+        result_dict = {}
+
+        use_relation = self.steplist_dict[stepconfig_groupname]['use_relations']
+        if use_relation:
+            eqation = self.steplist_dict[stepconfig_groupname]['equation']
+            var_sym = relparm_dict['variable']
+            var_name = relparm_dict['channel_name']
+            result_dict['range_type'] = 'Follow'
+            result_dict['follow'] = f'{eqation}, {var_sym} = {var_name}'
+        else:
+            range_type = step_item_dict['range_type']
+            step_type = step_item_dict['step_type']
+            if range_type == 'Single':
+                result_dict['range_type'] = 'Single'
+                result_dict['single'] = step_item_dict['single']
+                result_dict['start'] = step_item_dict['single']
+                result_dict['stop'] = step_item_dict['single']
+                result_dict['center'] = step_item_dict['single']
+                result_dict['span'] = 0
+                result_dict['step'] = 0
+                result_dict['n_pts'] = 1
+            else:
+                result_dict['range_type'] = 'Sweep'
+                if range_type == 'Start - Stop':
+                    start = Decimal( str(step_item_dict['start']) )
+                    stop = Decimal( str(step_item_dict['stop']) )
+                    result_dict['start'] = float(start)
+                    result_dict['stop'] = float(stop)
+                    result_dict['center'] = float((start + stop) / 2)
+                    result_dict['span'] = float(abs(stop - start))
+                    span = Decimal( str(result_dict['span']) ) # for step use
+                if range_type == 'Center - Span': 
+                    center = Decimal( str(step_item_dict['center']) )
+                    span = Decimal( str(step_item_dict['span']) ) # also for step use
+                    result_dict['start'] = float(center - span/2)
+                    result_dict['stop'] = float(center + span/2)
+                    result_dict['center'] = float(center)
+                    result_dict['span'] = float(span)
+
+                
+                if step_type == 'Fixed step':
+                    result_dict['step'] = step_item_dict['step']
+                    result_dict['n_pts'] = int(round( span / Decimal(result_dict['step']))) + 1
+                if step_type == 'Fixed # of pts':
+                    result_dict['n_pts'] = int(step_item_dict['n_pts'])
+                    result_dict['step'] = float( span / Decimal(result_dict['n_pts']-1) )
+        return result_dict
+
+    def _get_step_list_dict(self) -> dict:
+        with h5py.File(self.filepath, 'r') as f:
+            dataset = f['Step list']
+            fields = dataset.dtype.names 
+            values = dataset
+            
+            result_dict = {}
+            for i in range(values.shape[0]):
+                indiviual_dict = {}
+                for field in fields:
+                    value = values[field][i]
+                    if type(value) == bytes:
+                        value = value.decode('utf-8')
+                    indiviual_dict[field] = value
+                result_dict[indiviual_dict['channel_name']] = indiviual_dict
+
+        return result_dict
+    def overview(self, print_option='111') -> None:
+        """ For nth digit of print option string: 1th -> trace, \
+            2nd -> instrument config, 3rd -> step config. 1 to print, \
+            0 for don't print. 
+        """
+        if int(str(print_option)[0]):
+            print('Traces:')
+            for index, name in self.traces_map.items():
+                print(f'{index} : {name}')
+            print('----------')
+        if int(str(print_option)[1]):
+            print('instrument config:')
+            for index, name in self.instconfig_map.items():
+                print(f'{index} : {name}')
+            print('----------')
+        if int(str(print_option)[2]):
+            print('step config:')
+            for index, name in self.stepconfig_map.items():
+                print(f'{index} : {name}')
+            print('----------')
+
+    def get_trace_by_name(self, name:str) ->  np.ndarray:
+        with h5py.File(self.filepath, 'r') as f:
+            """ Return trace data by given name."""
+            return np.array(f['Traces'][name])
+    def get_trace_by_index(self, index: int) -> np.ndarray:
+        """ Return trace data by index, according to mapping in dict `traces_ds_map`."""
+        with h5py.File(self.filepath, 'r') as f:
+            return np.array(f['Traces'][self.traces_map[index]])
+        
+
+    def get_instconfig_by_index(self, index: int) -> dict:
+        """ Return trace data by index, according to mapping in dict `instconfig_ds_map`."""
+        with h5py.File(self.filepath, 'r') as f:
+            return dict(f['Instrument config'][self.instconfig_map[index]].attrs)
+    def get_instconfig_by_name(self, name: str) -> dict:
+        """ Return trace data by index, according to mapping in dict `instconfig_ds_map`."""
+        with h5py.File(self.filepath, 'r') as f:
+            return dict(f['Instrument config'][name].attrs)       
+    
+    def get_stepconfig_by_name(self, name: str, reevaluate=True) -> dict:
+        def get_key_by_value(dictionary, target_value):
+            return next((key for key, value in dictionary.items() if value == target_value), -1)
+        index = get_key_by_value(self.stepconfig_map, name)
+        if index == -1:
+            raise Exception('No such step config name') from None
+        else:
+            return self.get_stepconfig_by_index(index, reevaluate)
+    def get_stepconfig_by_index(self, index: int, reevaluate=True) -> dict:
+        """ Return trace data by index, according to mapping in dict `instconfig_ds_map`."""
+        with h5py.File(self.filepath, 'r') as f:
+            stepconfig_groupname = self.stepconfig_map[index]
+
+            # toss Optimizer since it is not valid outside Labber logbrowser
+            stepconfig_dict = {'Step items': None, 'Relation parameters': None}
+            
+            #### Construct Step items dictionary
+            enum_mapping = {
+                "range_type": {0: "Single", 1: "Start - Stop", 2: "Center - Span"},
+                "step_type": {0: "Fixed step", 1: "Fixed # of pts"},
+            }
+            # read raw step item into a dictionary
+            dataset = f['Step config'][stepconfig_groupname]['Step items']
+            fields = dataset.dtype.names 
+            values = dataset
+            stepitem_dict = {field: float(values[field][0]) for field in fields}
+            # convert enum to string
+            for key in ['range_type', 'step_type']:
+                enum_value = stepitem_dict[key]
+                stepitem_dict[key] = enum_mapping[key][enum_value]
+            # done
+
+            #### Construct Relation parameters dictionary
+            dataset = f['Step config'][stepconfig_groupname]['Relation parameters']
+            fields = dataset.dtype.names
+            values = dataset
+            relparm_dict = {field: values[field][0] for field in fields}
+
+            if type(relparm_dict['variable']) == bytes:
+                relparm_dict['variable'] = relparm_dict['variable'].decode('utf-8')
+            if type(relparm_dict['channel_name']) == bytes:
+                relparm_dict['channel_name'] = relparm_dict['channel_name'].decode('utf-8')
+            
+            relparm_dict['use_lookup'] = bool(relparm_dict['use_lookup'])
+            # done
+
+            if reevaluate:
+                stepitem_dict = self._get_reevaluated_step_item(
+                    stepitem_dict, relparm_dict, stepconfig_groupname
+                )
+            stepconfig_dict['Step items'] = stepitem_dict
+            stepconfig_dict['Relation parameters'] = relparm_dict
+            return stepconfig_dict   
+
+
+def raw_trace_to_trace(raw:np.array):
+    """Convert raw data from labber to trace data.
+
+    After observing the data structure of Labber's HDF5 files:
+    1. for complexed ones : as [n-th pts, re (0) or im (1), n-th trace] array.
+    2. for real ones: as [n-th pts, re, n-th trace] array.
+
+    this function convert it to [n-th trace, pts] array.
+    """
+    if raw.shape[1] == 1: dtype = 'real'
+    if raw.shape[1] == 2: dtype = 'complex'
+
+    if dtype == 'complex':
+        traces = raw[:, 0, :] + 1j * raw[:, 1, :]
+    if dtype == 'real':
+        traces = raw[:, 0, :]
+    return traces.T
+
+def get_xy_arrays_and_names(file: LabberHDF):
+    """Return xarray, yarray, xname, yname.
+    
+    For 1D trace, yname and yarray will be None.
+    
+    xname is defalut to be "x", and auto detect to be either
+    "VNA - Frequency" and "ADC - Time". Detect is by name, so might not work.
+    """
+
+    ## inst sweep, (x)
+    # array 
+    trace_names = file.traces_map.values()
+    matching_trace = next(
+        (name for name in trace_names 
+        if name.endswith('_t0dt') and 'demodulated' not in name),
+        None
+    )
+    if matching_trace:
+        trace_prefix = matching_trace[:-5] # get rid of _t0dt
+        x0, delta_x = file.get_trace_by_name(trace_prefix + '_t0dt')[0]
+        n_x = file.get_trace_by_name(trace_prefix + '_N')[0]
+        xarray = x0 + np.arange(n_x) * delta_x
+        # name, use some commonly used names that user may define
+        vna_names = ['VNA', 'ZVA', 'ZVB']
+        adc_names = ['ADC', 'Digitizer', 'Alazar Card']
+        xname = 'x' # default name
+        for vna_name in vna_names:
+            if vna_name.lower() in trace_prefix.lower():
+                xname = 'VNA - Frequency'
+        for adc_name in adc_names:
+            if adc_name.lower() in trace_prefix.lower():
+                xname = 'ADC - Time'
+
+    ## labeer sweep, (y)
+    sweepings = []
+    for index, name in file.stepconfig_map.items():
+        try:
+            stepconfig = file.get_stepconfig_by_name(name)
+            if stepconfig['Step items']['range_type'] == 'Sweep':
+                sweepings.append((name, stepconfig))
+        except KeyError:
+            pass
+    if len(sweepings) == 0:
+        # trace on z, x is index, y is empty
+        yname, yarray = None, None
+    elif len(sweepings) == 1:
+        # trace on z, xy as index
+        sweeping = sweepings[0]
+        yname = sweeping[0]
+        y_item = sweeping[1]['Step items']
+        y0, y1, ny = y_item['start'], y_item['stop'], y_item['n_pts']
+        yarray = np.linspace(y0, y1, ny)
+        # # flip the array if start is greater then stop, since labber store traces in this way
+        # if y0 > y1:
+        #     yarray = yarray[::-1]
+    else:
+        raise Exception('Now only support one or zero sweep quantity')
+
+    return xarray, yarray, xname, yname
+
+def auto_xyz(file: LabberHDF, trace_name: str):
+    """Return xarr, yarr, zarr, xname, yname, zname.
+    
+    For 2D: x, y as index, z as data.
+    For 1D: x as index, z as data (y is NONE).
+    
+    xname is defalut to be "x", and auto detect to be either
+    "VNA - Frequency" and "ADC - Time". Detect is by name, so might not work.
+    """
+    traces_raw = file.get_trace_by_name(trace_name)
+    traces = raw_trace_to_trace(traces_raw)
+    xarray, yarray, xname, yname = get_xy_arrays_and_names(file)
+
+    return xarray, yarray, traces, xname, yname, trace_name
+
+def get_zarray(file: LabberHDF, trace_name: str):
+    """Reutne zarray only, faster then using auto_xyz for large number of files."""
+    traces_raw = file.get_trace_by_name(trace_name)
+    traces = raw_trace_to_trace(traces_raw)
+
+    return traces
